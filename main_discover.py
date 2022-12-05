@@ -47,9 +47,11 @@ parser.add_argument("--pretrained", type=str, help="pretrained checkpoint path")
 parser.add_argument("--multicrop", default=False, action="store_true", help="activates multicrop")
 parser.add_argument("--num_large_crops", default=2, type=int, help="number of large crops")
 parser.add_argument("--num_small_crops", default=2, type=int, help="number of small crops")
+parser.add_argument("--skip_labeled", default=False, action="store_true", help="train only using unlabeled data")
 
 
 class Discoverer(pl.LightningModule):
+
     def __init__(self, **kwargs):
         super().__init__()
         self.save_hyperparameters({k: v for (k, v) in kwargs.items() if not callable(v)})
@@ -149,32 +151,45 @@ class Discoverer(pl.LightningModule):
         outputs = self.model(views)
 
         # gather outputs
-        outputs["logits_lab"] = (
-            outputs["logits_lab"].unsqueeze(1).expand(-1, self.hparams.num_heads, -1, -1)
-        )
-        logits = torch.cat([outputs["logits_lab"], outputs["logits_unlab"]], dim=-1)
-        logits_over = torch.cat([outputs["logits_lab"], outputs["logits_unlab_over"]], dim=-1)
+        if self.hparams.skip_labeled:
+            logits = outputs["logits_unlab"]
+            logits_over = outputs["logits_unlab_over"]
+        else:
+            outputs["logits_lab"] = (
+                outputs["logits_lab"].unsqueeze(1).expand(-1, self.hparams.num_heads, -1, -1)
+            )
+            logits = torch.cat([outputs["logits_lab"], outputs["logits_unlab"]], dim=-1)
+            logits_over = torch.cat([outputs["logits_lab"], outputs["logits_unlab_over"]], dim=-1)
 
-        # create targets
-        targets_lab = (
-            F.one_hot(labels[mask_lab], num_classes=self.hparams.num_labeled_classes)
-            .float()
-            .to(self.device)
-        )
+            # create targets
+            targets_lab = (
+                F.one_hot(labels[mask_lab], num_classes=self.hparams.num_labeled_classes)
+                .float()
+                .to(self.device)
+            )
+
         targets = torch.zeros_like(logits)
         targets_over = torch.zeros_like(logits_over)
 
         # generate pseudo-labels with sinkhorn-knopp and fill unlab targets
         for v in range(self.hparams.num_large_crops):
             for h in range(self.hparams.num_heads):
-                targets[v, h, mask_lab, :nlc] = targets_lab.type_as(targets)
-                targets_over[v, h, mask_lab, :nlc] = targets_lab.type_as(targets)
-                targets[v, h, ~mask_lab, nlc:] = self.sk(
-                    outputs["logits_unlab"][v, h, ~mask_lab]
-                ).type_as(targets)
-                targets_over[v, h, ~mask_lab, nlc:] = self.sk(
-                    outputs["logits_unlab_over"][v, h, ~mask_lab]
-                ).type_as(targets)
+                if not self.hparams.skip_labeled:
+                    targets[v, h, mask_lab, :nlc] = targets_lab.type_as(targets)
+                    targets_over[v, h, mask_lab, :nlc] = targets_lab.type_as(targets)
+                    targets[v, h, ~mask_lab, nlc:] = self.sk(
+                        outputs["logits_unlab"][v, h, ~mask_lab]
+                    ).type_as(targets)
+                    targets_over[v, h, ~mask_lab, nlc:] = self.sk(
+                        outputs["logits_unlab_over"][v, h, ~mask_lab]
+                    ).type_as(targets)
+                else:
+                    targets[v, h, ~mask_lab] = self.sk(
+                        outputs["logits_unlab"][v, h, ~mask_lab]
+                    ).type_as(targets)
+                    targets_over[v, h, ~mask_lab] = self.sk(
+                        outputs["logits_unlab_over"][v, h, ~mask_lab]
+                    ).type_as(targets) 
 
         # compute swapped prediction loss
         loss_cluster = self.swapped_prediction(logits, targets)
